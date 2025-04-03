@@ -1,0 +1,19 @@
+[0;1;32m●[0m discord-music-bot.service - Discord Music Bot Service
+     Loaded: loaded (/etc/systemd/system/discord-music-bot.service; enabled; vendor preset: enabled)
+     Active: [0;1;32mactive (running)[0m since Wed 2025-04-02 00:55:11 UTC; 34s ago
+   Main PID: 37262 (python)
+      Tasks: 5 (limit: 1035)
+     Memory: 45.8M
+     CGroup: /system.slice/discord-music-bot.service
+             └─37262 /home/ubuntu/discord-music-bot/venv/bin/python /home/ubuntu/discord-music-bot/bot.py
+
+Apr 02 00:55:26 discord-342358 python[37262]: [2025-04-02 00:55:26] [INFO    ] discord.voice_state: Connecting to voice...
+Apr 02 00:55:26 discord-342358 python[37262]: INFO:discord.voice_state:Connecting to voice...
+Apr 02 00:55:26 discord-342358 python[37262]: [2025-04-02 00:55:26] [INFO    ] discord.voice_state: Starting voice handshake... (connection attempt 1)
+Apr 02 00:55:26 discord-342358 python[37262]: INFO:discord.voice_state:Starting voice handshake... (connection attempt 1)
+Apr 02 00:55:26 discord-342358 python[37262]: [2025-04-02 00:55:26] [INFO    ] discord.voice_state: Voice handshake complete. Endpoint found: seattle8447.discord.media
+Apr 02 00:55:26 discord-342358 python[37262]: INFO:discord.voice_state:Voice handshake complete. Endpoint found: seattle8447.discord.media
+Apr 02 00:55:27 discord-342358 python[37262]: [2025-04-02 00:55:27] [INFO    ] discord.voice_state: Voice connection complete.
+Apr 02 00:55:27 discord-342358 python[37262]: INFO:discord.voice_state:Voice connection complete.
+Apr 02 00:55:31 discord-342358 python[37262]: ERROR: [youtube] RneMEagAkcE: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies
+Apr 02 00:55:31 discord-342358 python[37262]: ERROR:root:YTDL Search DownloadError: ERROR: [youtube] RneMEagAkcE: Sign in to confirm you’re not a bot. Use --cookies-from-browser or --cookies for the authentication. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies. Also see  https://github.com/yt-dlp/yt-dlp/wiki/Extractors#exporting-youtube-cookies  for tips on effectively exporting YouTube cookies

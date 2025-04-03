@@ -1,0 +1,611 @@
+import discord
+from discord.ext import commands
+from discord import ui # Import the UI kit
+import yt_dlp
+import asyncio
+import os
+from dotenv import load_dotenv
+from collections import deque
+import logging
+
+# --- Basic Setup ---
+load_dotenv()
+TOKEN = os.getenv('DISCORD_TOKEN')
+
+logging.basicConfig(level=logging.INFO) # Set to DEBUG for more verbose output
+
+intents = discord.Intents.default()
+intents.message_content = True
+intents.voice_states = True
+intents.members = True # Needed for kick/ban commands to find members
+
+# Add necessary permissions checks
+bot = commands.Bot(command_prefix='!', intents=intents)
+
+# --- Music Variables ---
+music_queues = {}
+current_effects = {}
+voice_clients = {}
+now_playing_messages = {} # Store the message with buttons {guild_id: discord.Message}
+
+# --- FFmpeg Options ---
+FFMPEG_BASE_OPTIONS = '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5'
+FFMPEG_NORMAL_OPTIONS = f'{FFMPEG_BASE_OPTIONS} -vn'
+FFMPEG_BASS_BOOST_OPTIONS = f'{FFMPEG_BASE_OPTIONS} -af "bass=g=15,dynaudnorm=f=150:g=15" -vn'
+FFMPEG_8D_OPTIONS = f'{FFMPEG_BASE_OPTIONS} -af "apulsator=hz=0.08" -vn'
+
+# --- YTDL Options ---
+YTDL_FORMAT_OPTIONS = {
+    'format': 'bestaudio/best',
+    'outtmpl': '%(extractor)s-%(id)s-%(title)s.%(ext)s',
+    'restrictfilenames': True,
+    'noplaylist': True,
+    'nocheckcertificate': True, # Keep True for robustness
+    'ignoreerrors': False,
+    'logtostderr': False,
+    'quiet': True,
+    'no_warnings': True,
+    'default_search': 'auto',
+    'source_address': '0.0.0.0',
+    # 'cookiefile': '/home/ubuntu/discord-music-bot/cookies.txt', # Optional: Keep if testing YT
+}
+
+ytdl = yt_dlp.YoutubeDL(YTDL_FORMAT_OPTIONS)
+
+# --- Music Controls View (Buttons) ---
+
+class MusicControlsView(ui.View):
+    def __init__(self, *, timeout=None, bot_instance, guild_id):
+        super().__init__(timeout=timeout)
+        self.bot = bot_instance
+        self.guild_id = guild_id
+        self._update_buttons() # Initial button state
+
+    # Helper to get voice client safely
+    def _get_voice_client(self):
+        return voice_clients.get(self.guild_id)
+
+    # Update button labels/styles based on state
+    def _update_buttons(self):
+        vc = self._get_voice_client()
+        if vc and vc.is_paused():
+            # Find the pause button and update its label/style
+            for item in self.children:
+                if isinstance(item, ui.Button) and item.custom_id == "pause_resume":
+                    item.label = "▶️ Resume"
+                    item.style = discord.ButtonStyle.green
+                    break
+        elif vc and vc.is_playing():
+             for item in self.children:
+                if isinstance(item, ui.Button) and item.custom_id == "pause_resume":
+                    item.label = "⏸️ Pause"
+                    item.style = discord.ButtonStyle.secondary
+                    break
+        # Can add logic here to disable buttons if vc is None or not playing/paused
+
+    # Disable all buttons (e.g., when playback stops)
+    async def disable_all(self, interaction: discord.Interaction = None):
+         for item in self.children:
+            if isinstance(item, ui.Button):
+                item.disabled = True
+         if interaction:
+             try:
+                 await interaction.message.edit(view=self)
+             except discord.NotFound:
+                 pass # Message might have been deleted
+         else:
+            # If called without interaction (e.g., from stop command)
+            # need to retrieve the message first
+            message = now_playing_messages.get(self.guild_id)
+            if message:
+                try:
+                    await message.edit(view=self)
+                except discord.NotFound:
+                     pass # Message might have been deleted
+                # Clear the stored message reference
+                if self.guild_id in now_playing_messages:
+                     del now_playing_messages[self.guild_id]
+
+
+    @ui.button(label="⏸️ Pause", style=discord.ButtonStyle.secondary, custom_id="pause_resume")
+    async def pause_resume_button(self, interaction: discord.Interaction, button: ui.Button):
+        vc = self._get_voice_client()
+        if not vc:
+            await interaction.response.send_message("I'm not connected to a voice channel.", ephemeral=True)
+            return
+
+        if vc.is_playing():
+            vc.pause()
+            button.label = "▶️ Resume"
+            button.style = discord.ButtonStyle.green
+            await interaction.response.edit_message(view=self) # Update the button appearance
+            # Send a subtle confirmation
+            # await interaction.followup.send("Paused.", ephemeral=True) # Can be noisy
+        elif vc.is_paused():
+            vc.resume()
+            button.label = "⏸️ Pause"
+            button.style = discord.ButtonStyle.secondary
+            await interaction.response.edit_message(view=self) # Update the button appearance
+            # await interaction.followup.send("Resumed.", ephemeral=True)
+        else:
+            await interaction.response.send_message("I'm not playing or paused right now.", ephemeral=True)
+
+    @ui.button(label="⏭️ Skip", style=discord.ButtonStyle.primary, custom_id="skip")
+    async def skip_button(self, interaction: discord.Interaction, button: ui.Button):
+        vc = self._get_voice_client()
+        if vc and (vc.is_playing() or vc.is_paused()):
+            vc.stop() # Triggers the 'after' callback which calls play_next
+            await interaction.response.send_message("Skipping song...", ephemeral=True) # Ephemeral confirmation
+            # The 'play_next' function will handle sending the new "Now Playing"
+            # No need to disable buttons here, play_next will send a new view
+        elif self.guild_id in music_queues and music_queues[self.guild_id]:
+             # If stopped but items are in queue, force play_next
+             await interaction.response.defer(ephemeral=True) # Acknowledge interaction
+             await play_next(interaction.channel) # Use channel context here
+             await interaction.followup.send("Trying to play next in queue...", ephemeral=True)
+        else:
+            await interaction.response.send_message("Nothing to skip.", ephemeral=True)
+
+
+    @ui.button(label="⏹️ Stop", style=discord.ButtonStyle.danger, custom_id="stop")
+    async def stop_button(self, interaction: discord.Interaction, button: ui.Button):
+        vc = self._get_voice_client()
+        guild_id = interaction.guild_id
+
+        if vc and (vc.is_playing() or vc.is_paused()):
+            music_queues[guild_id].clear()
+            vc.stop()
+            await self.disable_all(interaction) # Disable buttons on the current message
+            await interaction.followup.send("⏹️ Stopped music and cleared the queue.") # Followup because disable_all might edit
+        else:
+            await interaction.response.send_message("Not playing anything to stop.", ephemeral=True)
+        # Note: disable_all() called from here handles removing the message reference
+
+# --- YTDLSource Class (modified search for SoundCloud) ---
+class YTDLSource(discord.PCMVolumeTransformer):
+    def __init__(self, source, *, data, volume=0.5):
+        super().__init__(source, volume)
+        self.data = data
+        self.title = data.get('title')
+        self.url = data.get('webpage_url') # Use webpage_url for the original link
+        self.duration = data.get('duration')
+
+    @classmethod
+    async def from_url(cls, url, *, loop=None, stream=False, ffmpeg_options=FFMPEG_NORMAL_OPTIONS):
+        loop = loop or asyncio.get_event_loop()
+        try:
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=not stream))
+        except yt_dlp.utils.DownloadError as e:
+            logging.error(f"YTDL DownloadError: {e}")
+            return None
+
+        if 'entries' in data:
+            data = data['entries'][0]
+
+        filename = data['url'] if stream else ytdl.prepare_filename(data)
+        final_ffmpeg_opts = f'{ffmpeg_options}'
+        return cls(discord.FFmpegPCMAudio(filename, before_options=FFMPEG_BASE_OPTIONS, options=final_ffmpeg_opts.replace(FFMPEG_BASE_OPTIONS, '').strip()), data=data)
+
+    @classmethod
+    async def search(cls, query, *, loop=None, stream=False, ffmpeg_options=FFMPEG_NORMAL_OPTIONS):
+        loop = loop or asyncio.get_event_loop()
+        try:
+            search_query = f"scsearch1:{query}" # Defaulting back to SoundCloud as primary search
+            # search_query = f"ytsearch1:{query}" # Use this line for YouTube testing
+            data = await loop.run_in_executor(None, lambda: ytdl.extract_info(search_query, download=not stream))
+
+            if 'entries' in data and data['entries']:
+                data = data['entries'][0]
+            elif not data:
+                logging.warning(f"YTDL search for '{query}' returned no results.")
+                return None
+            else:
+                 pass # Single result
+
+            filename = data['url'] if stream else ytdl.prepare_filename(data)
+            final_ffmpeg_opts = f'{ffmpeg_options}'
+            return cls(discord.FFmpegPCMAudio(filename, before_options=FFMPEG_BASE_OPTIONS, options=final_ffmpeg_opts.replace(FFMPEG_BASE_OPTIONS, '').strip()), data=data)
+
+        except yt_dlp.utils.DownloadError as e:
+             logging.error(f"YTDL Search DownloadError: {e}")
+             return None
+        except Exception as e:
+             logging.error(f"Unexpected error during YTDL search: {e}")
+             return None
+
+
+# --- Bot Events ---
+@bot.event
+async def on_ready():
+    print(f'Logged in as {bot.user.name} ({bot.user.id})')
+    print('------')
+    # Initialize queues and effects for guilds the bot is already in
+    for guild in bot.guilds:
+        if guild.id not in music_queues: music_queues[guild.id] = deque()
+        if guild.id not in current_effects: current_effects[guild.
+id] = FFMPEG_NORMAL_OPTIONS
+        if guild.id not in voice_clients: voice_clients[guild.id] = None
+        if guild.id not in now_playing_messages: now_playing_messages[guild.id] = None
+
+
+# --- Music Playback Core Logic ---
+async def play_next(ctx_or_channel):
+    # Determine guild_id and how to send messages based on input type
+    if isinstance(ctx_or_channel, commands.Context):
+        guild_id = ctx_or_channel.guild.id
+        channel = ctx_or_channel # Use context to send messages
+    elif isinstance(ctx_or_channel, discord.TextChannel):
+        guild_id = ctx_or_channel.guild.id
+        channel = ctx_or_channel # Use channel to send messages
+    else:
+         logging.error(f"Invalid context/channel provided to play_next: {type(ctx_or_channel)}")
+         return # Cannot proceed
+
+    # --- Clean up previous Now Playing message ---
+    if guild_id in now_playing_messages and now_playing_messages[guild_id]:
+        old_message = now_playing_messages[guild_id]
+        try:
+            # Create a disabled view to replace the old one
+            view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
+            for item in view.children: item.disabled = True
+            await old_message.edit(content="*Previous song ended.*", embed=None, view=view)
+        except discord.NotFound:
+            pass # Old message was deleted
+        except Exception as e:
+             logging.error(f"Error editing old Now Playing message: {e}")
+        finally:
+             now_playing_messages[guild_id] = None # Clear reference
+
+    # --- Play next song logic ---
+    if guild_id in music_queues and music_queues[guild_id]:
+        query = music_queues[guild_id].popleft()
+        ffmpeg_options = current_effects.get(guild_id, FFMPEG_NORMAL_OPTIONS)
+        voice_client = voice_clients.get(guild_id)
+
+        if not voice_client or not voice_client.is_connected():
+            logging.warning(f"Voice client disconnected for guild {guild_id} before playing next.")
+            await channel.send("Lost connection, cannot play next song.")
+            return
+
+        try:
+            # Show "Thinking..." message
+            thinking_message = await channel.send(f"🔄 Searching for `{query}`...")
+
+            player = None
+            if "http://" in query or "https://" in query:
+                player = await YTDLSource.from_url(query, loop=bot.loop, stream=True, ffmpeg_options=ffmpeg_options)
+            else:
+                player = await YTDLSource.search(query, loop=bot.loop, stream=True, ffmpeg_options=ffmpeg_options)
+
+            # Delete "Thinking..." message
+            try:
+                await thinking_message.delete()
+            except discord.NotFound:
+                pass # Already deleted?
+
+            if player is None:
+                await channel.send(f"❌ Couldn't find or play '{query}'. Skipping.")
+                await play_next(channel) # Try next song
+                return
+
+            # --- Send New Now Playing Message with Buttons ---
+            view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
+            embed = discord.Embed(title="🎶 Now Playing", description=f"**{player.title}**", color=discord.Color.blurple())
+            if player.url:
+                 embed.url = player.url
+            if player.duration:
+                 embed.add_field(name="Duration", value=f"{int(player.duration // 60)}:{int(player.duration % 60):02d}")
+
+            now_playing_msg = await channel.send(embed=embed, view=view)
+            now_playing_messages[guild_id] = now_playing_msg # Store the message reference
+
+            # Play the audio
+            voice_client.play(player, after=lambda e: asyncio.run_coroutine_threadsafe(play_next_after_error(channel, e), bot.loop))
+
+        except Exception as e:
+            logging.error(f"Error playing next song: {e}")
+            await channel.send(f"An error occurred while trying to play the next song: {e}")
+            # Attempt to play the *next* item in the queue if this one failed hard
+            await asyncio.sleep(2)
+            await play_next(channel)
+
+    else:
+        # Queue finished
+        # Clean up the last Now Playing message if it exists
+        if guild_id in now_playing_messages and now_playing_messages[guild_id]:
+            old_message = now_playing_messages[guild_id]
+            try:
+                view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
+                for item in view.children: item.disabled = True
+                await old_message.edit(content="⏹️ Queue finished.", embed=None, view=view)
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                logging.error(f"Error editing final Now Playing message: {e}")
+            finally:
+                now_playing_messages[guild_id] = None # Clear reference
+        else:
+             # If no now_playing message reference, just send a simple text message
+             await channel.send("⏹️ Queue finished!")
+        # Optional: Add inactivity timer here
+
+# Wrapper for 'after' callback to pass channel context
+async def play_next_after_error(channel, error):
+    if error:
+        logging.error(f'Player error: {error}')
+        await channel.send(f'Player error: {error}. Skipping to next song.')
+    # Always try to play the next song, error or not
+    await play_next(channel)
+
+# --- Bot Commands ---
+
+@bot.command(name='join', help='Tells the bot to join the voice channel')
+async def join(ctx):
+    if not ctx.message.author.voice:
+        await ctx.send(f"{ctx.message.author.name} is not connected to a voice channel.")
+        return
+
+    channel = ctx.message.author.voice.channel
+    guild_id = ctx.guild.id
+
+    if voice_clients.get(guild_id) and voice_clients[guild_id].is_connected():
+        if voice_clients[guild_id].channel != channel:
+            await voice_clients[guild_id].move_to(channel)
+            await ctx.send(f"Moved to {channel.name}")
+        else:
+            await ctx.send("Already in your voice channel.")
+    else:
+        try:
+            voice_client = await channel.connect()
+            voice_clients[guild_id] = voice_client
+            if guild_id not in music_queues: music_queues[guild_id] = deque()
+            if guild_id not in current_effects: current_effects[guild_id] = FFMPEG_NORMAL_OPTIONS
+            await ctx.send(f"Joined {channel.name}")
+        except Exception as e:
+            logging.error(f"Error joining voice channel {channel.name}: {e}")
+            await ctx.send(f"Failed to join {channel.name}. Error: {e}")
+
+
+@bot.command(name='play', aliases=['p'], help='Searches SoundCloud or plays the given URL (SC/YT)')
+async def play(ctx, *, query: str):
+    guild_id = ctx.guild.id
+    voice_client = voice_clients.get(guild_id)
+
+    if not voice_client or not voice_client.is_connected():
+        if ctx.message.author.voice:
+            await join(ctx)
+            voice_client = voice_clients.get(guild_id)
+            if not voice_client:
+                await ctx.send("Could not join your voice channel. Please use `!join` first.")
+                return
+        else:
+            await ctx.send("You are not in a voice channel, and I'm not connected.")
+            return
+
+    if guild_id not in music_queues: music_queues[guild_id] = deque()
+    if guild_id not in current_effects: current_effects[guild_id] = FFMPEG_NORMAL_OPTIONS
+
+    is_playing = voice_client.is_playing() or voice_client.is_paused()
+    music_queues[guild_id].append(query)
+    await ctx.send(f"✅ Added to queue: **{query}**")
+
+    if not is_playing:
+        await play_next(ctx) # Pass context to send messages
+
+
+@bot.command(name='pause', help='Pauses the current song (use button instead)')
+async def pause(ctx):
+     await ctx.send("Please use the ⏸️ button on the 'Now Playing' message.")
+
+@bot.command(name='resume', help='Resumes the paused song (use button instead)')
+async def resume(ctx):
+    await ctx.send("Please use the ▶️ button on the 'Now Playing' message.")
+
+@bot.command(name='stop', help='Stops the music and clears the queue (use button instead)')
+async def stop(ctx):
+    await ctx.send("Please use the ⏹️ button on the 'Now Playing' message.")
+
+@bot.command(name='skip', help='Skips the current song (use button instead)')
+async def skip(ctx):
+     await ctx.send("Please use the ⏭️ button on the 'Now Playing' message.")
+
+
+@bot.command(name='queue', aliases=['q'], help='Shows the current music queue')
+async def queue(ctx):
+    guild_id = ctx.guild.id
+    queue = music_queues.get(guild_id)
+    voice_client = voice_clients.get(guild_id)
+    current_msg = now_playing_messages.get(guild_id)
+
+    if not queue and (not voice_client or not voice_client.source):
+         await ctx.send("The queue is empty and nothing is playing!")
+         return
+
+    embed = discord.Embed(title="Music Queue", color=discord.Color.blue())
+    current_song = ""
+    # Try getting title from current player first
+    if voice_client and voice_client.source and hasattr(voice_client.source, 'title'):
+        current_song = f"▶️ **{voice_client.source.title}**"
+        if hasattr(voice_client.source, 'duration') and voice_client.source.duration:
+             duration = voice_client.source.duration
+             current_song += f" ({int(duration // 60)}:{int(duration % 60):02d})"
+        current_song += "\n\n"
+    # Fallback: try getting info from the now_playing message embed if player is gone
+    elif current_msg and current_msg.embeds:
+         current_song = f"▶️ {current_msg.embeds[0].description}\n\n" # Approx
+
+    queue_list = ""
+    if queue:
+        for i, item in enumerate(list(queue)[:10]):
+            queue_list += f"{i + 1}. {item}\n"
+        if len(queue) > 10:
+            queue_list += f"\n...and {len(queue) - 10} more."
+    else:
+        queue_list = "Queue is empty."
+
+    embed.description = current_song + queue_list
+    await ctx.send(embed=embed)
+
+
+@bot.command(name='leave', aliases=['disconnect'], help='Disconnects the bot from the voice channel')
+async def leave(ctx):
+    guild_id = ctx.guild.id
+    voice_client = voice_clients.get(guild_id)
+
+    if voice_client and voice_client.is_connected():
+        # Clean up now playing message before disconnecting
+        if guild_id in now_playing_messages and now_playing_messages[guild_id]:
+            old_message = now_playing_messages[guild_id]
+            try:
+                view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
+                for item in view.children: item.disabled = True
+                await old_message.edit(content="Disconnected.", embed=None, view=view)
+            except discord.NotFound:
+                pass
+            except Exception as e:
+                 logging.error(f"Error editing Now Playing message on leave: {e}")
+            finally:
+                 now_playing_messages[guild_id] = None
+
+        if guild_id in music_queues: music_queues[guild_id].clear() # Clear queue on leave
+        await voice_client.disconnect()
+        await ctx.send("Disconnected from the voice channel.")
+        voice_clients[guild_id] = None # Clear the stored client
+    else:
+        await ctx.send("I'm not in a voice channel.")
+
+# --- Audio Effects Commands (Still Text-Based) ---
+async def apply_effect(ctx, effect_name, ffmpeg_options):
+    guild_id = ctx.guild.id
+    current_effects[guild_id] = ffmpeg_options
+    await ctx.send(f"🎧 Effect set to: **{effect_name}**. It will apply to the *next* song played or if you skip.")
+
+@bot.command(name='bassboost', aliases=['bb'], help='Applies a bass boost effect (applies to next song)')
+async def bassboost(ctx):
+    await apply_effect(ctx, "Bass Boost", FFMPEG_BASS_BOOST_OPTIONS)
+
+@bot.command(name='8d', help='Applies a pseudo-8D audio effect (applies to next song)')
+async def eight_d(ctx):
+     await apply_effect(ctx, "8D Audio", FFMPEG_8D_OPTIONS)
+
+@bot.command(name='normal', help='Resets audio effects to normal (applies to next song)')
+async def normal(ctx):
+    await apply_effect(ctx, "Normal", FFMPEG_NORMAL_OPTIONS)
+
+
+# --- Administrative Commands ---
+
+@bot.command(name='kick', help='Kicks a member from the server.')
+@commands.has_permissions(kick_members=True) # Check if invoker has kick permission
+async def kick(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    """Kicks a member. Requires Kick Members permission."""
+    if member == ctx.author:
+        await ctx.send("You cannot kick yourself!")
+        return
+    if member == bot.user:
+        await ctx.send("I cannot kick myself!")
+        return
+    # Optional: Check role hierarchy - bot needs role higher than member
+    # if ctx.guild.me.top_role <= member.top_role:
+    #     await ctx.send("I don't have permission to kick that member (check role hierarchy).")
+    #     return
+
+    try:
+        await member.kick(reason=f"Kicked by {ctx.author.name}: {reason}")
+        await ctx.send(f"👢 Kicked {member.mention} for: {reason}")
+        logging.info(f"User {ctx.author} kicked {member} for reason: {reason}")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have the necessary permissions to kick members.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Failed to kick member. Error: {e}")
+        logging.error(f"HTTPException kicking {member}: {e}")
+
+@bot.command(name='ban', help='Bans a member from the server.')
+@commands.has_permissions(ban_members=True) # Check if invoker has ban permission
+async def ban(ctx, member: discord.Member, *, reason: str = "No reason provided"):
+    """Bans a member. Requires Ban Members permission."""
+    if member == ctx.author:
+        await ctx.send("You cannot ban yourself!")
+        return
+    if member == bot.user:
+        await ctx.send("I cannot ban myself!")
+        return
+    # Optional: Check role hierarchy
+    # if ctx.guild.me.top_role <= member.top_role:
+    #     await ctx.send("I don't have permission to ban that member (check role hierarchy).")
+    #     return
+
+    try:
+        await member.ban(reason=f"Banned by {ctx.author.name}: {reason}", delete_message_days=0) # Change delete_message_days if needed
+        await ctx.send(f"🔨 Banned {member.mention} for: {reason}")
+        logging.info(f"User {ctx.author} banned {member} for reason: {reason}")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have the necessary permissions to ban members.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Failed to ban member. Error: {e}")
+        logging.error(f"HTTPException banning {member}: {e}")
+
+@bot.command(name='clear', aliases=['purge'], help='Clears a specified number of messages.')
+@commands.has_permissions(manage_messages=True) # Check invoker permission
+async def clear(ctx, amount: int):
+    """Clears messages. Requires Manage Messages permission."""
+    if amount <= 0:
+        await ctx.send("Please specify a positive number of messages to clear.")
+        return
+    if amount > 100: # Discord API limit for bulk delete is 100
+        await ctx.send("I can only clear up to 100 messages at a time.")
+        amount = 100
+
+    try:
+        # amount + 1 to include the command message itself
+        deleted = await ctx.channel.purge(limit=amount + 1)
+        await ctx.send(f"🗑️ Deleted {len(deleted) - 1} message(s).", delete_after=5) # Confirmation disappears
+        logging.info(f"User {ctx.author} cleared {len(deleted) -1} messages in channel {ctx.channel.id}")
+    except discord.Forbidden:
+        await ctx.send("❌ I don't have the 'Manage Messages' permission to clear messages.")
+    except discord.HTTPException as e:
+        await ctx.send(f"❌ Failed to clear messages. Error: {e}")
+        logging.error(f"HTTPException clearing messages in {ctx.channel.id}: {e}")
+
+
+# --- Error Handling ---
+@bot.event
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.CommandNotFound):
+        await ctx.send("❓ Invalid command.")
+    elif isinstance(error, commands.MissingRequiredArgument):
+        await ctx.send(f"✋ Missing arguments for the command: `{error.param.name}`")
+    elif isinstance(error, commands.MissingPermissions):
+         await ctx.send(f"⛔ You don't have the required permissions to use this command: `{' '.join(error.missing_permissions)}`")
+    elif isinstance(error, commands.BotMissingPermissions):
+         await ctx.send(f"❌ I don't have the required permissions to perform this action: `{' '.join(error.missing_permissions)}`")
+    elif isinstance(error, commands.CommandInvokeError):
+        # Check for specific YTDL errors if needed
+        original = error.original
+        if isinstance(original, yt_dlp.utils.DownloadError):
+             if "Sign in to confirm" in str(original):
+                  await ctx.send("❌ YouTube is asking for a sign-in. Try using a direct YouTube URL or SoundCloud.")
+             elif "certificate verify failed" in str(original):
+                  await ctx.send("❌ SSL Certificate verification failed. Please check server setup or report.")
+             else:
+                 await ctx.send(f"❌ Download error: {original}")
+        else:
+            logging.error(f"Error executing command {ctx.command}: {original}")
+            await ctx.send(f"An error occurred: {original}")
+    elif isinstance(error, commands.BadArgument):
+         await ctx.send(f"❌ Invalid argument provided. {error}")
+    else:
+        logging.error(f"Unhandled command error: {error}")
+        await ctx.send(f"An unexpected error occurred: {error}")
+
+# --- Run the Bot ---
+if __name__ == "__main__":
+    if TOKEN is None:
+        print("ERROR: DISCORD_TOKEN environment variable not set!")
+    else:
+        try:
+            bot.run(TOKEN)
+        except discord.LoginFailure:
+            print("ERROR: Invalid Discord Token. Please check your .env file.")
+        except Exception as e:
+             print(f"An error occurred while running the bot: {e}")

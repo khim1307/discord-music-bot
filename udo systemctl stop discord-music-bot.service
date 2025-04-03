@@ -1,0 +1,11 @@
+[0;1;31m●[0m discord-music-bot.service - Discord Music Bot Service
+     Loaded: loaded (/etc/systemd/system/discord-music-bot.service; enabled; vendor preset: enabled)
+     Active: [0;1;31mfailed[0m (Result: exit-code) since Tue 2025-04-01 22:53:43 UTC; 7s ago
+    Process: 19822 ExecStart=/home/ubuntu/discord-music-bot/venv/bin/python bot.py #<-- Adjust path if needed [0;1;31m(code=exited, status=216/GROUP)[0m
+   Main PID: 19822 (code=exited, status=216/GROUP)
+
+Apr 01 22:53:43 discord-342358 systemd[1]: discord-music-bot.service: Scheduled restart job, restart counter is at 5.
+Apr 01 22:53:43 discord-342358 systemd[1]: Stopped Discord Music Bot Service.
+Apr 01 22:53:43 discord-342358 systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mdiscord-music-bot.service: Start request repeated too quickly.[0m
+Apr 01 22:53:43 discord-342358 systemd[1]: [0;1;38;5;185m[0;1;39m[0;1;38;5;185mdiscord-music-bot.service: Failed with result 'exit-code'.[0m
+Apr 01 22:53:43 discord-342358 systemd[1]: [0;1;31m[0;1;39m[0;1;31mFailed to start Discord Music Bot Service.[0m

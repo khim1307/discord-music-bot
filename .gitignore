@@ -1,0 +1,24 @@
+# Discord Bot Token and other secrets
+.env
+
+# Cookies file (contains login session!)
+cookies.txt
+
+# Python Virtual Environment
+venv/
+/venv/ # Alternate common pattern
+
+# Python cache files
+__pycache__/
+*.pyc
+*.pyo
+
+# Temporary download files (if any)
+*.webm
+*.m4a
+*.mp3
+*.part
+
+# OS generated files (optional)
+.DS_Store
+Thumbs.db
