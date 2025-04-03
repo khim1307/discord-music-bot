@@ -8,6 +8,7 @@ import os
 from dotenv import load_dotenv
 from collections import deque
 import logging
+import json
 
 # --- Basic Setup ---
 load_dotenv()
@@ -25,6 +26,43 @@ intents.members = True
 # REMOVE command_prefix if ONLY using slash commands, or keep for hybrid
 # bot = commands.Bot(command_prefix='!', intents=intents) # Old
 bot = commands.Bot(command_prefix="!", intents=intents) # Keep prefix for now? Or remove if going full slash
+
+# --- Role Configuration ---
+ROLE_CONFIG_FILE = "role_config.json"
+role_mappings = {} # {guild_id: {role_id: {'label': 'Button Label', 'style': 'primary/secondary/etc.', 'emoji': 'optional_emoji'}}}
+
+def load_role_config():
+    """Loads role mappings from the JSON file."""
+    global role_mappings
+    try:
+        with open(ROLE_CONFIG_FILE, 'r') as f:
+            # Convert keys back to integers after loading from JSON
+            loaded_config = json.load(f)
+            role_mappings = {int(gid): {int(rid): data for rid, data in roles.items()}
+                             for gid, roles in loaded_config.items()}
+            logging.info("Role configuration loaded successfully.")
+    except FileNotFoundError:
+        logging.warning(f"{ROLE_CONFIG_FILE} not found. Initializing empty config.")
+        role_mappings = {}
+    except json.JSONDecodeError:
+        logging.error(f"Error decoding {ROLE_CONFIG_FILE}. Initializing empty config.")
+        role_mappings = {}
+    except Exception as e:
+        logging.error(f"Failed to load role config: {e}")
+        role_mappings = {} # Fallback to empty
+
+def save_role_config():
+    """Saves current role mappings to the JSON file."""
+    global role_mappings
+    try:
+        # Convert keys to strings for JSON compatibility
+        config_to_save = {str(gid): {str(rid): data for rid, data in roles.items()}
+                          for gid, roles in role_mappings.items()}
+        with open(ROLE_CONFIG_FILE, 'w') as f:
+            json.dump(config_to_save, f, indent=4)
+        logging.info("Role configuration saved successfully.")
+    except Exception as e:
+        logging.error(f"Failed to save role config: {e}")
 
 # --- Music Variables & Options (Remain Mostly the Same) ---
 music_queues = {}
@@ -139,6 +177,8 @@ class MusicControlsView(ui.View):
         vc = self._get_voice_client()
         guild_id = interaction.guild_id
         if vc and (vc.is_playing() or vc.is_paused()):
+            if not interaction.response.is_done():
+              await interaction.response.defer(ephemeral=True) # Acknowledge silently
             music_queues[guild_id].clear()
             vc.stop()
             # Need to disable buttons on the message this interaction came from
@@ -147,7 +187,32 @@ class MusicControlsView(ui.View):
         else:
              await interaction.response.send_message("Not playing anything.", ephemeral=True)
 
+    @ui.button(label="🔊 BB", style=discord.ButtonStyle.primary, custom_id="effect_bassboost")
+    async def bassboost_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Applies Bass Boost effect for the next song."""
+        guild_id = interaction.guild_id
+        if guild_id is None: return # Should not happen
 
+        current_effects[guild_id] = FFMPEG_BASS_BOOST_OPTIONS
+        await interaction.response.send_message("🔊 Bass Boost enabled (applies to next song).", ephemeral=True)
+
+    @ui.button(label="🎧 8D", style=discord.ButtonStyle.primary, custom_id="effect_8d")
+    async def eightd_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Applies 8D effect for the next song."""
+        guild_id = interaction.guild_id
+        if guild_id is None: return
+
+        current_effects[guild_id] = FFMPEG_8D_OPTIONS
+        await interaction.response.send_message("🎧 8D Audio enabled (applies to next song).", ephemeral=True)
+
+    @ui.button(label="⚪ Normal", style=discord.ButtonStyle.secondary, custom_id="effect_normal")
+    async def normal_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Resets audio effects to normal for the next song."""
+        guild_id = interaction.guild_id
+        if guild_id is None: return
+
+        current_effects[guild_id] = FFMPEG_NORMAL_OPTIONS
+        await interaction.response.send_message("⚪ Audio effects reset to Normal (applies to next song).", ephemeral=True)
 # --- YTDLSource Class (Keep as is) ---
 class YTDLSource(discord.PCMVolumeTransformer):
     # ... (Keep the existing YTDLSource code as is) ...
@@ -157,7 +222,13 @@ class YTDLSource(discord.PCMVolumeTransformer):
         self.title = data.get('title')
         self.url = data.get('webpage_url')
         self.duration = data.get('duration')
+        self.thumbnail = data.get('thumbnail')
+        if not self.thumbnail and data.get('thumbnails'):
+             # Prioritize larger thumbnails if available in the list
+             thumbnails = sorted(data['thumbnails'], key=lambda t: t.get('width', 0) * t.get('height', 0), reverse=True)
+             if thumbnails: self.thumbnail = thumbnails[0].get('url') # Get URL of the best one
 
+        self.extractor = data.get('extractor_key', 'Unknown').capitalize() # Get source (e.g., 'Youtube', 'Soundcloud')
     @classmethod
     async def from_url(cls, url, *, loop=None, stream=False, ffmpeg_options=FFMPEG_NORMAL_OPTIONS):
         loop = loop or asyncio.get_event_loop()
@@ -202,7 +273,7 @@ async def on_ready():
         if guild.id not in current_effects: current_effects[guild.id] = FFMPEG_NORMAL_OPTIONS
         if guild.id not in voice_clients: voice_clients[guild.id] = None
         if guild.id not in now_playing_messages: now_playing_messages[guild.id] = None
-
+    load_role_config() # Load the role mappings
     # --- Command Syncing ---
     try:
         # Sync globally (can take up to an hour to propagate)
@@ -225,6 +296,76 @@ async def on_ready():
     except Exception as e:
         print(f"Error syncing commands: {e}")
 
+# --- Global Interaction Handler for Persistent Role Buttons ---
+@bot.event
+async def on_interaction(interaction: discord.Interaction):
+    # Always defer or respond to non-view interactions first if necessary
+    # If using only slash commands, bot.process_commands might not be needed
+    # await bot.process_commands(interaction) # Use if you still have prefix commands
+
+    # Check if it's a button click (component interaction)
+    if interaction.type == discord.InteractionType.component:
+        custom_id = interaction.data.get('custom_id')
+
+        # Check if it's one of our persistent role buttons
+        if custom_id and custom_id.startswith("role_assign_"):
+            # --- Role Assignment Logic (Mirrors the old callback) ---
+            try:
+                role_id = int(custom_id.split('_')[-1])
+            except (IndexError, ValueError):
+                await interaction.response.send_message("Could not identify the role for this button.", ephemeral=True)
+                return
+
+            guild = interaction.guild
+            # Ensure interaction is in a guild and member is valid
+            if not guild or not isinstance(interaction.user, discord.Member):
+                await interaction.response.send_message("This interaction can only happen in a server.", ephemeral=True)
+                return
+            member = interaction.user # Member who clicked
+
+            # Fetch the role object
+            role = guild.get_role(role_id)
+            if not role:
+                await interaction.response.send_message("The role for this button no longer exists.", ephemeral=True)
+                return
+
+            # Check bot permissions before deferring
+            if not guild.me.guild_permissions.manage_roles:
+                await interaction.response.send_message("I don't have the 'Manage Roles' permission.", ephemeral=True)
+                return
+            if guild.me.top_role <= role:
+                await interaction.response.send_message(f"I cannot manage '{role.name}' due to role hierarchy.", ephemeral=True)
+                return
+
+            # Defer response - essential for operations that might take time
+            await interaction.response.defer(ephemeral=True, thinking=False) # Ephemeral ACK
+
+            try:
+                # Toggle the role
+                if role in member.roles:
+                    await member.remove_roles(role, reason="Self-removed via persistent button")
+                    await interaction.followup.send(f"✅ Role '{role.name}' removed.", ephemeral=True)
+                    logging.info(f"[Persistent] Removed role {role.id} from {member.id} in guild {guild.id}")
+                else:
+                    await member.add_roles(role, reason="Self-assigned via persistent button")
+                    await interaction.followup.send(f"✅ Role '{role.name}' added!", ephemeral=True)
+                    logging.info(f"[Persistent] Added role {role.id} to {member.id} in guild {guild.id}")
+
+            except discord.Forbidden:
+                await interaction.followup.send(f"❌ Forbidden: Cannot modify roles for '{role.name}'.", ephemeral=True)
+                logging.warning(f"[Persistent] Forbidden error modifying role {role.id} for user {member.id} in guild {guild.id}")
+            except discord.HTTPException as e:
+                await interaction.followup.send(f"❌ Error modifying roles: {e}", ephemeral=True)
+                logging.error(f"[Persistent] HTTPException modifying role {role.id} for {member.id}: {e}")
+            except Exception as e:
+                 await interaction.followup.send(f"❌ Unexpected error.", ephemeral=True)
+                 logging.error(f"[Persistent] Unexpected error in role handler role {role.id} user {member.id}: {e}")
+
+        # --- Handle other component interactions if needed ---
+        # E.g., you could check for music control button custom_ids here
+        # if the View object might not always be available, although
+        # for music controls, the View is usually tied to the current song
+        # and cleaned up, so relying on the View object's callback is often fine.
 # --- Music Playback Core Logic (Needs Adjustment) ---
 # Modify play_next to handle interaction or channel context better
 async def play_next(interaction_or_channel):
@@ -252,7 +393,9 @@ async def play_next(interaction_or_channel):
 
     # --- Play next song logic ---
     if guild_id in music_queues and music_queues[guild_id]:
-        query = music_queues[guild_id].popleft()
+        queue_entry = music_queues[guild_id].popleft()
+        query = queue_entry.get('query', 'Unknown Query') # Get query
+        requester = queue_entry.get('requester') # Get discord.User object
         ffmpeg_options = current_effects.get(guild_id, FFMPEG_NORMAL_OPTIONS)
         voice_client = voice_clients.get(guild_id)
 
@@ -299,6 +442,54 @@ async def play_next(interaction_or_channel):
                       await channel.send(err_msg)
                  await play_next(channel) # Try next, pass channel
                  return
+            # --- Build the New Embed ---
+            view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
+            embed = discord.Embed(
+                title="🎶 Now Playing",
+                color=discord.Color.green() # Changed color slightly
+            )
+
+            # Clickable Title + URL
+            if player.url:
+                embed.description = f"**[{player.title}]({player.url})**"
+            else:
+                embed.description = f"**{player.title}**"
+
+            # Thumbnail
+            if player.thumbnail:
+                embed.set_thumbnail(url=player.thumbnail)
+
+            # Fields
+            if player.duration:
+                duration_str = f"{int(player.duration // 60)}:{int(player.duration % 60):02d}"
+                embed.add_field(name="Duration", value=duration_str, inline=True)
+            else:
+                 embed.add_field(name="Duration", value="N/A", inline=True) # Placeholder
+
+            if requester:
+                embed.add_field(name="Requested by", value=requester.mention, inline=True)
+            else:
+                embed.add_field(name="Requested by", value="Unknown", inline=True) # Fallback
+
+            # Queue Info - Get current queue length *after* popping
+            queue_len = len(music_queues.get(guild_id, []))
+            embed.add_field(name="Queue", value=f"{queue_len} remaining", inline=True)
+
+            # Footer (Source Info)
+            footer_text = f"Source: {player.extractor}"
+            # Optional: Add icons
+            icon_url = ""
+            if player.extractor == 'Soundcloud':
+                # Find a soundcloud icon URL online if desired
+                 icon_url = "https://icons.iconarchive.com/icons/custom-icon-design/pretty-office-7/32/Soundcloud-icon.png" # Example
+            elif player.extractor == 'Youtube':
+                 # Find a youtube icon URL online if desired
+                 icon_url = "https://icons.iconarchive.com/icons/social-media-icons/glossy-social-media/32/Youtube-icon.png" # Example
+
+            if icon_url:
+                embed.set_footer(text=footer_text, icon_url=icon_url)
+            else:
+                embed.set_footer(text=footer_text)
 
             # --- Send New Now Playing Message with Buttons ---
             view = MusicControlsView(bot_instance=bot, guild_id=guild_id)
@@ -383,6 +574,46 @@ async def ensure_voice(interaction: discord.Interaction):
         await interaction.response.send_message(f"Failed to join {channel.name}. Error: {e}", ephemeral=True)
         return None
 
+@bot.tree.command(name="help", description="Displays a list of available commands.")
+async def help_slash(interaction: discord.Interaction):
+    """Shows available slash commands."""
+    try:
+        embed = discord.Embed(
+            title=f"{bot.user.name} Commands",
+            description="Here are the available slash commands:",
+            color=discord.Color.blue() # Or your preferred color
+        )
+
+        # Get commands registered to the tree (handles global and guild-specific if synced)
+        # Sorting commands alphabetically
+        registered_commands = sorted(bot.tree.get_commands(), key=lambda cmd: cmd.name)
+
+        if not registered_commands:
+             embed.description = "No slash commands seem to be registered currently."
+        else:
+            for command in registered_commands:
+                # Future: Could add specific formatting for command groups if you add them later
+                # if isinstance(command, app_commands.Group):
+                #    pass # Add group handling
+                # else:
+                embed.add_field(
+                    name=f"/{command.name}",
+                    value=command.description or "No description provided.", # Use description
+                    inline=False # List each command on a new line
+                )
+
+        embed.set_footer(text="Use /<command name> to run a command.")
+
+        # Send the embed as an ephemeral message (only visible to the user who typed /help)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    except Exception as e:
+        logging.error(f"Error generating help command: {e}")
+        # Avoid failing silently if embed creation fails
+        try:
+            await interaction.response.send_message("Sorry, couldn't generate the help message right now.", ephemeral=True)
+        except discord.InteractionResponded: # Might have already responded if error was late
+            await interaction.followup.send("Sorry, couldn't generate the help message right now.", ephemeral=True)
 
 @bot.tree.command(name="join", description="Tells the bot to join your voice channel.")
 async def join_slash(interaction: discord.Interaction):
@@ -425,8 +656,12 @@ async def play_slash(interaction: discord.Interaction, query: str):
     if guild_id not in music_queues: music_queues[guild_id] = deque()
 
     is_playing_or_paused = voice_client.is_playing() or voice_client.is_paused()
-    music_queues[guild_id].append(query)
-
+    # Store query and requester info together
+    queue_entry = {
+        'query': query,
+        'requester': interaction.user # Store the discord.User object
+    }
+    music_queues[guild_id].append(queue_entry)
     # Send confirmation message via followup
     await interaction.followup.send(f"✅ Added to queue: **{query}**")
 
@@ -516,6 +751,140 @@ async def eightd_slash(interaction: discord.Interaction):
 @bot.tree.command(name="normal", description="Resets audio effects to normal for next song.")
 async def normal_slash(interaction: discord.Interaction):
       await apply_effect_slash(interaction, "Normal", FFMPEG_NORMAL_OPTIONS)
+
+# Button View for Role Assignment
+class RoleAssignView(ui.View):
+    def __init__(self, guild_id: int, timeout=None):
+        super().__init__(timeout=timeout)
+        self.guild_id = guild_id
+
+        # Load mappings for this specific guild
+        guild_map = role_mappings.get(self.guild_id, {})
+
+        # Dynamically create buttons based on config
+        for role_id_str, config in guild_map.items():
+            role_id = int(role_id_str) # Role ID is stored as string key in JSON/dict
+
+            # Determine button style
+            style_str = config.get('style', 'secondary').lower()
+            if style_str == 'primary': style = discord.ButtonStyle.primary
+            elif style_str == 'success': style = discord.ButtonStyle.success
+            elif style_str == 'danger': style = discord.ButtonStyle.danger
+            else: style = discord.ButtonStyle.secondary # Default
+
+            # Create and add the button
+            button = ui.Button(
+                label=config.get('label', f'Role {role_id}'),
+                emoji=config.get('emoji'), # Will be None if not set
+                style=style,
+                custom_id=f"role_assign_{role_id}" # Use role ID in custom_id
+            )
+            self.add_item(button)
+
+# --- Role Setup Commands ---
+
+# Define allowed button styles for the choice parameter
+ButtonStyleChoices = [
+    app_commands.Choice(name="Secondary (Default Gray)", value="secondary"),
+    app_commands.Choice(name="Primary (Blurple)", value="primary"),
+    app_commands.Choice(name="Success (Green)", value="success"),
+    app_commands.Choice(name="Danger (Red)", value="danger"),
+]
+
+@bot.tree.command(name="setup_role", description="Adds or updates a self-assignable role button.")
+@app_commands.describe(
+    role="The role members can assign themselves.",
+    label="The text displayed on the button.",
+    style="The color/style of the button.",
+    emoji="An optional emoji for the button (e.g., ✅ or custom :emoji:)."
+)
+@app_commands.choices(style=ButtonStyleChoices) # Use choices for the style
+@app_commands.default_permissions(manage_roles=True) # Require manage_roles for setup
+@app_commands.checks.has_permissions(manage_roles=True)
+async def setup_role_slash(interaction: discord.Interaction, role: discord.Role, label: str, style: app_commands.Choice[str] = None, emoji: str = None):
+    """Sets up or updates a role button."""
+    guild_id = interaction.guild_id
+    if not guild_id: return # Should not happen in guild command
+
+    # Basic validation
+    if len(label) > 80: # Discord button label limit
+        await interaction.response.send_message("Button label cannot exceed 80 characters.", ephemeral=True)
+        return
+    if emoji and len(emoji) > 50: # Basic emoji length check
+        await interaction.response.send_message("Emoji seems too long.", ephemeral=True)
+        return
+    # Check if bot can even assign this role (hierarchy)
+    if interaction.guild.me.top_role <= role:
+         await interaction.response.send_message(f"❌ I cannot manage the role '{role.name}' due to role hierarchy. My highest role must be above it.", ephemeral=True)
+         return
+
+    # Ensure guild_id entry exists
+    if guild_id not in role_mappings:
+        role_mappings[guild_id] = {}
+
+    # Store configuration
+    button_config = {
+        'label': label,
+        'style': style.value if style else 'secondary', # Use choice value or default
+        'emoji': emoji # Store emoji string (or None)
+    }
+    role_mappings[guild_id][role.id] = button_config # Use role ID as key
+
+    save_role_config() # Save changes to JSON
+
+    await interaction.response.send_message(f"✅ Role button for '{role.name}' configured with label '{label}'. Use `/role_menu` to display it.", ephemeral=True)
+    logging.info(f"Role {role.id} configured by {interaction.user.id} in guild {guild_id}")
+
+@bot.tree.command(name="remove_role", description="Removes a role from the self-assignable button menu.")
+@app_commands.describe(role="The role button to remove.")
+@app_commands.default_permissions(manage_roles=True)
+@app_commands.checks.has_permissions(manage_roles=True)
+async def remove_role_slash(interaction: discord.Interaction, role: discord.Role):
+    """Removes a configured role button."""
+    guild_id = interaction.guild_id
+    if not guild_id: return
+
+    if guild_id in role_mappings and role.id in role_mappings[guild_id]:
+        del role_mappings[guild_id][role.id]
+        # Optional: remove guild entry if it becomes empty
+        if not role_mappings[guild_id]:
+            del role_mappings[guild_id]
+
+        save_role_config() # Save changes
+        await interaction.response.send_message(f"🗑️ Role button configuration for '{role.name}' removed.", ephemeral=True)
+        logging.info(f"Role {role.id} configuration removed by {interaction.user.id} in guild {guild_id}")
+    else:
+        await interaction.response.send_message(f"Role '{role.name}' is not currently configured for self-assignment.", ephemeral=True)
+
+
+@bot.tree.command(name="role_menu", description="Displays the message with self-assignable role buttons.")
+@app_commands.default_permissions(manage_roles=True) # Optionally restrict who can post the menu
+# @app_commands.checks.has_permissions(manage_roles=True) # Or remove checks to allow anyone
+async def role_menu_slash(interaction: discord.Interaction):
+    """Posts the role assignment menu."""
+    guild_id = interaction.guild_id
+    if not guild_id: return
+
+    guild_map = role_mappings.get(guild_id, {})
+    if not guild_map:
+        await interaction.response.send_message("No self-assignable roles have been configured for this server yet. Use `/setup_role` first.", ephemeral=True)
+        return
+
+    # Create the view based on current config
+    view = RoleAssignView(guild_id=guild_id, timeout=None)
+ # Example: Send to the channel where command was used
+    target_channel = interaction.channel
+    await target_channel.send(
+        content="**Roles tự chọn**\nNhấn vào role muốn nhận, nhấn lại để xóa role", # Example text
+        view=view
+    )
+
+    # Send the message containing the view
+    await interaction.response.send_message(
+        content="Click the buttons below to add or remove roles:", # Optional introductory text
+        view=view
+    )
+    logging.info(f"Role menu posted by {interaction.user.id} in guild {guild_id}")
 
 # --- Administrative Slash Commands ---
 
