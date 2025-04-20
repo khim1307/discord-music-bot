@@ -1,0 +1,26 @@
+2025-04-20 22:12:44,873:INFO:discord.client: logging in using static token
+2025-04-20 22:12:45,554:INFO:root: Running setup hook...
+2025-04-20 22:12:46,091:INFO:root: MusicCog initialized and inactivity check started.
+2025-04-20 22:12:46,092:INFO:root: MusicCog loaded.
+2025-04-20 22:12:46,092:INFO:root: Successfully loaded extension: cogs.music_cog
+2025-04-20 22:12:46,093:INFO:root: Role configuration loaded successfully by RoleAssignCog.
+2025-04-20 22:12:46,093:INFO:root: RoleAssignCog loaded.
+2025-04-20 22:12:46,094:INFO:root: Successfully loaded extension: cogs.role_assign_cog
+2025-04-20 22:12:46,095:INFO:root: AdminCog loaded.
+2025-04-20 22:12:46,095:INFO:root: Successfully loaded extension: cogs.admin_cog
+2025-04-20 22:12:46,976:INFO:root: Google AI Client configured successfully (AICog).
+2025-04-20 22:12:46,977:INFO:root: Google AI Model initialized (AICog).
+2025-04-20 22:12:46,977:INFO:root: AICog loaded.
+2025-04-20 22:12:46,977:INFO:root: Successfully loaded extension: cogs.ai_cog
+2025-04-20 22:12:46,977:INFO:root: Linked role_mappings from RoleAssignCog to main bot.
+2025-04-20 22:12:46,977:INFO:root: Syncing commands...
+2025-04-20 22:12:47,209:INFO:root: Synced 11 command(s) globally.
+2025-04-20 22:12:47,458:INFO:discord.gateway: Shard ID None has connected to Gateway (Session ID: 2e87615d41f9e09ee36dee09a04adcf7).
+2025-04-20 22:12:49,465:INFO:root: Bot logged in as WFJ Bot
+2025-04-20 22:13:12,077:INFO:discord.voice_state: Connecting to voice...
+2025-04-20 22:13:12,077:INFO:discord.voice_state: Starting voice handshake... (connection attempt 1)
+2025-04-20 22:13:12,325:INFO:discord.voice_state: Voice handshake complete. Endpoint found: japan1637.discord.media
+2025-04-20 22:13:13,032:INFO:discord.voice_state: Voice connection complete.
+2025-04-20 22:13:27,340:INFO:root: Started playing 'MẶT MỘC | Phạm Nguyên Ngọc x VAnh x Ân Nhi (Original)' G394512741328486400
+2025-04-20 22:13:41,932:INFO:discord.player: ffmpeg process 213215 has not terminated. Waiting to terminate...
+2025-04-20 22:13:41,936:INFO:discord.player: ffmpeg process 213215 should have terminated with a return code of -9.
